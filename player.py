@@ -19,7 +19,7 @@ LOW  = {"1":"z","2":"x","3":"c","4":"v","5":"b","6":"n","7":"m"}  # -1 octave
 ACC_SHARP = {"#1", "#4", "#5"}  # Shift + [1/4/5]
 ACC_FLAT  = {"b3", "b7"}        # Ctrl  + [3/7]
 
-# "1=C" chromatic mapping (limited to your game's supported accidentals)
+# "1=C" mapping into the only accidentals your game supports
 PC_TO_TOKEN = {
     0: "1",    # C
     1: "#1",   # C#
@@ -35,10 +35,12 @@ PC_TO_TOKEN = {
     11:"7",    # B
 }
 
-# Game playable 3 octaves buckets:
-LOW_MIN, HIGH_MAX = 48, 83   # C3..B5 (Z..Q rows)
-MID_MIN, MID_MAX  = 60, 71   # C4..B4 (A row)  <-- target center range
-MID_CENTER = 66              # around F#4/Gb4, just a numeric center target
+# Register ranges (MIDI notes) corresponding to your 3 rows:
+LOW_MIN, LOW_MAX   = 48, 59   # C3..B3  (z..m)
+MID_MIN, MID_MAX   = 60, 71   # C4..B4  (a..j)
+HIGH_MIN, HIGH_MAX = 72, 83   # C5..B5  (q..u)
+
+PLAY_MIN, PLAY_MAX = LOW_MIN, HIGH_MAX
 
 @dataclass
 class Span:
@@ -50,9 +52,9 @@ class Span:
 
 @dataclass
 class MelNote:
-    t: float       # onset time (seconds)
-    midi: int      # original midi note
-    dur: float     # duration until next onset (seconds)
+    t: float
+    midi: int
+    dur: float
 
 @dataclass
 class Event:
@@ -60,9 +62,57 @@ class Event:
     seconds: float
     orig_midi: int
     shifted_midi: int
+    r: float
+    reg: str
 
 # ----------------------------
-# MIDI parsing (track or merged)
+# Key signature -> transpose-to-C
+# ----------------------------
+def _parse_key_signature_to_tonic_pc(key: str) -> int:
+    """
+    mido key examples:
+      Major: 'C', 'G', 'F#', 'Bb'
+      Minor: 'a', 'f#', 'eb' (lowercase)
+    Return tonic pitch-class: C=0..B=11
+    """
+    key = key.strip()
+    tonic_map = {
+        "C":0, "C#":1, "Db":1, "D":2, "D#":3, "Eb":3, "E":4, "F":5,
+        "F#":6, "Gb":6, "G":7, "G#":8, "Ab":8, "A":9, "A#":10, "Bb":10, "B":11,
+    }
+    if not key:
+        raise ValueError("Empty key")
+
+    if key[0].islower():  # minor
+        k = key[0].upper() + key[1:]  # 'f#'->'F#'
+        if k in tonic_map:
+            return tonic_map[k]
+        raise ValueError(f"Unsupported minor key format: {key}")
+
+    if key in tonic_map:
+        return tonic_map[key]
+    raise ValueError(f"Unsupported key signature: {key}")
+
+def detect_key_signature(mid: mido.MidiFile) -> Optional[str]:
+    for tr in mid.tracks:
+        for msg in tr:
+            if msg.type == "key_signature":
+                return msg.key
+    return None
+
+def transpose_to_c_from_key(key: str) -> int:
+    """
+    Compute semitone shift to move tonic -> C.
+    Return small shift in [-6..+6] when possible.
+    """
+    tonic = _parse_key_signature_to_tonic_pc(key)  # 0..11
+    t = (-tonic) % 12  # 0..11
+    if t > 6:
+        t -= 12
+    return t
+
+# ----------------------------
+# MIDI parsing
 # ----------------------------
 def parse_spans_merged(mid: mido.MidiFile, ignore_drums: bool = True) -> List[Span]:
     tempo = 500000
@@ -77,7 +127,7 @@ def parse_spans_merged(mid: mido.MidiFile, ignore_drums: bool = True) -> List[Sp
         if msg.type == "set_tempo":
             tempo = msg.tempo
 
-        if msg.type in ("note_on","note_off"):
+        if msg.type in ("note_on", "note_off"):
             ch = getattr(msg, "channel", 0)
             if ignore_drums and ch == 9:
                 continue
@@ -113,7 +163,7 @@ def parse_spans_track(mid: mido.MidiFile, track_index: int, ignore_drums: bool =
         if msg.type == "set_tempo":
             tempo = msg.tempo
 
-        if msg.type in ("note_on","note_off"):
+        if msg.type in ("note_on", "note_off"):
             ch = getattr(msg, "channel", 0)
             if ignore_drums and ch == 9:
                 continue
@@ -136,7 +186,7 @@ def parse_spans_track(mid: mido.MidiFile, track_index: int, ignore_drums: bool =
     return spans
 
 # ----------------------------
-# Melody extraction: group chord onsets -> pick highest note per onset
+# Melody extraction (highest note per onset)
 # ----------------------------
 def spans_to_melody(spans: List[Span], chord_eps: float) -> List[MelNote]:
     if not spans:
@@ -152,96 +202,71 @@ def spans_to_melody(spans: List[Span], chord_eps: float) -> List[MelNote]:
             cur = [s]
     groups.append(cur)
 
-    # pick melody note = highest pitch in group
     onsets: List[Tuple[float, int]] = []
     for g in groups:
         t0 = g[0].start
         mel = max(g, key=lambda x: x.midi).midi
         onsets.append((t0, mel))
 
-    # durations based on next onset time
     melody: List[MelNote] = []
     for i, (t0, n) in enumerate(onsets):
         if i + 1 < len(onsets):
             dur = max(0.03, onsets[i+1][0] - t0)
         else:
-            # last: just a small tail
             dur = 0.25
         melody.append(MelNote(t=t0, midi=n, dur=dur))
     return melody
 
 # ----------------------------
-# Phrase segmentation: split when time gap > phrase_gap
+# Bucket normalize (your "0..100 -> 0..1 -> 3 registers") + octave-fit
 # ----------------------------
-def split_phrases(melody: List[MelNote], phrase_gap: float) -> List[List[MelNote]]:
-    if not melody:
-        return []
-    phrases: List[List[MelNote]] = []
-    cur = [melody[0]]
-    for prev, nxt in zip(melody, melody[1:]):
-        gap = max(0.0, nxt.t - prev.t)
-        if gap > phrase_gap:
-            phrases.append(cur)
-            cur = [nxt]
-        else:
-            cur.append(nxt)
-    phrases.append(cur)
-    return phrases
+def _relative_height(note: int, nmin: int, nmax: int) -> float:
+    if nmax <= nmin:
+        return 0.5
+    return (note - nmin) / (nmax - nmin)
 
-# ----------------------------
-# Choose ONE octave shift (multiple of 12) per phrase to center into MID range
-# ----------------------------
-def phrase_cost(notes: List[int], shift: int) -> float:
-    """
-    Lower is better.
-    Penalize notes outside game range hard.
-    Prefer notes inside MID range (60..71) and close to MID_CENTER.
-    """
-    cost = 0.0
-    for n in notes:
-        nn = n + shift
+def _choose_register(r: float) -> str:
+    if r < (1.0/3.0):
+        return "low"
+    elif r < (2.0/3.0):
+        return "mid"
+    else:
+        return "high"
 
-        # out of game range -> huge penalty
-        if nn < LOW_MIN or nn > HIGH_MAX:
-            cost += 1e6 + (abs(nn - (LOW_MIN if nn < LOW_MIN else HIGH_MAX)) * 500.0)
-            continue
+def _fit_to_register(note: int, reg: str) -> int:
+    if reg == "low":
+        rmin, rmax = LOW_MIN, LOW_MAX
+    elif reg == "mid":
+        rmin, rmax = MID_MIN, MID_MAX
+    else:
+        rmin, rmax = HIGH_MIN, HIGH_MAX
 
-        # inside mid range -> small cost by distance to center
-        if MID_MIN <= nn <= MID_MAX:
-            cost += (nn - MID_CENTER) ** 2
-        else:
-            # outside mid range but still playable -> penalty to encourage mid
-            # slightly prefer near mid edges
-            dist = (MID_MIN - nn) if nn < MID_MIN else (nn - MID_MAX)
-            cost += 200.0 + (dist ** 2) * 10.0
-    return cost
+    cand = note
+    while cand > rmax:
+        cand -= 12
+    while cand < rmin:
+        cand += 12
 
-def choose_phrase_shift(phrase: List[MelNote], base_transpose: int = 0) -> int:
-    notes = [m.midi + base_transpose for m in phrase]
-    # try shifts by octaves
-    candidates = [12*k for k in range(-6, 7)]
-    best_shift = 0
-    best_cost = float("inf")
-    for sh in candidates:
-        c = phrase_cost(notes, sh)
-        if c < best_cost:
-            best_cost = c
-            best_shift = sh
-    return best_shift
+    while cand < PLAY_MIN:
+        cand += 12
+    while cand > PLAY_MAX:
+        cand -= 12
 
-# ----------------------------
-# MIDI note -> token (after transpose+shift)
-# ----------------------------
+    return cand
+
 def midi_to_token(n: int) -> str:
     pc = n % 12
     core = PC_TO_TOKEN[pc]
-    if n < 60:
+    if n <= LOW_MAX:
         return "_" + core
-    elif n >= 72:
+    elif n >= HIGH_MIN:
         return "^" + core
     else:
         return core
 
+# ----------------------------
+# Token -> key stroke
+# ----------------------------
 def token_to_stroke(token: str) -> Optional[Tuple[List[Key], str, str]]:
     token = token.strip()
     if token == "0":
@@ -256,7 +281,7 @@ def token_to_stroke(token: str) -> Optional[Tuple[List[Key], str, str]]:
         token = token[1:]
 
     mods: List[Key] = []
-    degree = token  # "5" "#4" "b7"
+    degree = token  # "5", "#4", "b7"
 
     if degree in ACC_SHARP:
         mods.append(Key.shift)
@@ -290,13 +315,11 @@ def press_stroke(stroke: Tuple[List[Key], str, str], hold_s: float, dry_run: boo
     mods, key_char, _ = stroke
     mods_present: Set[Key] = set(mods)
 
-    # stable order
-    mods_unique = []
+    mods_unique: List[Key] = []
     for m in [Key.shift, Key.ctrl]:
         if m in mods_present:
             mods_unique.append(m)
 
-    # print physical sequence
     seq = []
     for m in mods_unique:
         seq.append("SHIFT↓" if m == Key.shift else "CTRL↓")
@@ -323,31 +346,40 @@ def press_stroke(stroke: Tuple[List[Key], str, str], hold_s: float, dry_run: boo
         kbd.release(m)
 
 # ----------------------------
-# Build final playable events
+# Build events
 # ----------------------------
-def build_events_phrase_center(melody: List[MelNote], phrase_gap: float, base_transpose: int) -> List[Event]:
-    phrases = split_phrases(melody, phrase_gap=phrase_gap)
+def build_events(melody: List[MelNote], total_transpose: int) -> List[Event]:
+    if not melody:
+        return []
+
+    notes_t = [m.midi + total_transpose for m in melody]
+    nmin = min(notes_t)
+    nmax = max(notes_t)
+
     events: List[Event] = []
+    for m in melody:
+        orig = m.midi
+        n = orig + total_transpose
 
-    for p_idx, ph in enumerate(phrases):
-        phrase_shift = choose_phrase_shift(ph, base_transpose=base_transpose)
-        # apply this shift to whole phrase
-        for m in ph:
-            shifted = m.midi + base_transpose + phrase_shift
+        r = _relative_height(n, nmin, nmax)
+        reg = _choose_register(r)
 
-            # hard clamp into game range by octave if needed (rare after scoring)
-            while shifted < LOW_MIN:
-                shifted += 12
-            while shifted > HIGH_MAX:
-                shifted -= 12
+        shifted = _fit_to_register(n, reg)
+        token = midi_to_token(shifted)
 
-            tok = midi_to_token(shifted)
-            events.append(Event(token=tok, seconds=m.dur, orig_midi=m.midi, shifted_midi=shifted))
-
+        events.append(Event(
+            token=token,
+            seconds=m.dur,
+            orig_midi=orig,
+            shifted_midi=shifted,
+            r=r,
+            reg=reg
+        ))
     return events
 
 def play(events: List[Event], start_delay: int, hold_ratio: float, jitter_ms: int, dry_run: bool):
-    print("=== Phrase Octave-Center AutoPlayer (melody-only) ===")
+    print("=== Range-Bucket + KeyFix AutoPlayer (melody-only) ===")
+    print("Logic: (1) transpose-to-C (optional) -> (2) relative height bucket -> (3) octave-fit into row")
     print("建議：英文輸入法 + 遊戲視窗置前 + 以管理員執行 Python")
     for i in range(start_delay, 0, -1):
         print(f"Starting in {i}...")
@@ -367,7 +399,10 @@ def play(events: List[Event], start_delay: int, hold_ratio: float, jitter_ms: in
             continue
 
         _, _, dbg = stroke
-        print(f"[{idx:04d}] +{logical_time:7.3f}s  MIDI {ev.orig_midi:3d} -> {ev.shifted_midi:3d} -> {ev.token:>4s} -> {dbg} | hold={hold:.3f}s dur={dur:.3f}s")
+        print(f"[{idx:04d}] +{logical_time:7.3f}s  MIDI {ev.orig_midi:3d} -> {ev.shifted_midi:3d}"
+              f" | r={ev.r:5.2f} reg={ev.reg:>4s} | {ev.token:>4s} -> {dbg}"
+              f" | hold={hold:.3f}s dur={dur:.3f}s")
+
         press_stroke(stroke, hold_s=hold, dry_run=dry_run)
 
         time.sleep(max(0.0, dur - hold) + jitter)
@@ -378,11 +413,17 @@ def play(events: List[Event], start_delay: int, hold_ratio: float, jitter_ms: in
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mid", help="path to .mid file")
-    ap.add_argument("--merge-tracks", action="store_true", help="merge all tracks into one timeline (default)")
-    ap.add_argument("--track", type=int, default=0, help="use a specific track if not merging")
-    ap.add_argument("--chord-eps", type=float, default=0.02, help="seconds: group notes starting together")
-    ap.add_argument("--phrase-gap", type=float, default=0.60, help="seconds: split phrase when onset gap > this")
-    ap.add_argument("--transpose", type=int, default=0, help="semitones (+/-) before phrase octave shifting")
+    ap.add_argument("--merge-tracks", action="store_true")
+    ap.add_argument("--track", type=int, default=0)
+    ap.add_argument("--chord-eps", type=float, default=0.02)
+
+    ap.add_argument("--normalize-to-c", action="store_true",
+                    help="use MIDI key_signature (if present) to transpose tonic->C before mapping")
+    ap.add_argument("--key", type=str, default=None,
+                    help="manual key signature, e.g. C, G, F#, Bb, a, f#, eb (used if --normalize-to-c has no key_signature)")
+    ap.add_argument("--transpose", type=int, default=0,
+                    help="additional manual semitone transpose (+/-)")
+
     ap.add_argument("--start-delay", type=int, default=4)
     ap.add_argument("--hold", type=float, default=0.55)
     ap.add_argument("--jitter-ms", type=int, default=8)
@@ -392,6 +433,22 @@ def main():
 
     mid = mido.MidiFile(args.mid)
     ignore_drums = not args.no_ignore_drums
+
+    auto_t = 0
+    if args.normalize_to_c:
+        ks = detect_key_signature(mid)
+        if ks is not None:
+            auto_t = transpose_to_c_from_key(ks)
+            print(f"Detected key_signature={ks}, auto transpose-to-C = {auto_t} semitones")
+        elif args.key:
+            auto_t = transpose_to_c_from_key(args.key)
+            print(f"No key_signature in MIDI, using --key={args.key}, transpose-to-C = {auto_t} semitones")
+        else:
+            print("No key_signature in MIDI and no --key provided; normalize-to-C skipped.")
+
+    total_transpose = args.transpose + auto_t
+    if total_transpose != 0:
+        print(f"Total transpose = {total_transpose} semitones")
 
     if args.merge_tracks:
         spans = parse_spans_merged(mid, ignore_drums=ignore_drums)
@@ -405,7 +462,7 @@ def main():
     melody = spans_to_melody(spans, chord_eps=args.chord_eps)
     print(f"melody_onsets={len(melody)}")
 
-    events = build_events_phrase_center(melody, phrase_gap=args.phrase_gap, base_transpose=args.transpose)
+    events = build_events(melody, total_transpose=total_transpose)
     print(f"events={len(events)}\n")
 
     play(events, start_delay=args.start_delay, hold_ratio=args.hold, jitter_ms=args.jitter_ms, dry_run=args.dry_run)
